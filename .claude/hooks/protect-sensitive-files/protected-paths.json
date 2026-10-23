@@ -1,0 +1,6 @@
+{
+  "_help": "User rules for protect.py. See README.md. 'protected' entries are a pattern string or {pattern, name, action: deny|ask}. 'exceptions' always win over matching rules. Set use_default_rules to false to replace the built-in rules entirely.",
+  "use_default_rules": true,
+  "protected": [],
+  "exceptions": []
+}
