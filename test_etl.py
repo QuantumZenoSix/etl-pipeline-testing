@@ -277,6 +277,14 @@ class EnrichCountriesTest(unittest.TestCase):
                 self.assertEqual(etl.enrich_countries(db), 0)
         urlopen.assert_not_called()
 
+    def test_country_update_uses_client_ip_index(self):
+        with tempfile.TemporaryDirectory() as tmp, closing(etl.open_db(Path(tmp) / "errors.db")) as conn:
+            plan = conn.execute(
+                "EXPLAIN QUERY PLAN UPDATE critical_errors SET country = ? WHERE client_ip = ? AND country IS NULL",
+                ("US", "8.8.8.8"),
+            ).fetchall()
+        self.assertIn("idx_critical_errors_client_ip", " ".join(str(row[-1]) for row in plan))
+
     def test_nothing_to_enrich_returns_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(etl.enrich_countries(Path(tmp) / "errors.db"), 0)

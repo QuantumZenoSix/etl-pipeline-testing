@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS critical_errors (
 )
 """
 
+# enrich_countries updates rows by client_ip; without this index each update scans the whole table.
+CLIENT_IP_INDEX = "CREATE INDEX IF NOT EXISTS idx_critical_errors_client_ip ON critical_errors (client_ip)"
+
 CSV_COLUMNS = ["report_date", "logged_at", "level", "module", "error_code", "client_ip", "country", "message"]
 
 
@@ -147,6 +150,7 @@ def lookup_country(ip: str) -> str | None:
 def open_db(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute(SCHEMA)
+    conn.execute(CLIENT_IP_INDEX)
     return conn
 
 
