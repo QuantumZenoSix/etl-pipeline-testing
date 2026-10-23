@@ -18,6 +18,10 @@ from pathlib import Path
 CRITICAL_LEVELS = {"emerg", "alert", "crit", "error"}
 COUNTRY_API_URL = "https://api.country.is/{ip}"
 API_TIMEOUT_SECONDS = 5
+MAX_RESPONSE_BYTES = 64 * 1024
+COUNTRY_CODE = re.compile(r"[A-Z]{2}")
+# Cells starting with these are treated as formulas by spreadsheet apps.
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 # e.g. [Thu Oct 22 08:15:11.221843 2026] [authz_core:error] [pid 1024:tid 1081] [client 1.2.3.4:51234] AH01630: message
 LOG_LINE = re.compile(
@@ -75,6 +79,8 @@ def parse_client_ip(client: str | None) -> str | None:
     # Apache always appends ":port". Strip it first: for IPv6 a short port such as
     # ":8080" is itself a valid group, so the whole string would parse as a wrong address.
     for candidate in (client.rsplit(":", 1)[0], client):
+        if "%" in candidate:
+            continue  # IPv6 scope ids accept arbitrary text, which would reach the DB, CSV and API URL
         try:
             return str(ipaddress.ip_address(candidate))
         except ValueError:
@@ -123,11 +129,12 @@ def extract_critical_entries(log_path: Path) -> list[LogEntry]:
 
 def lookup_country(ip: str) -> str | None:
     """Return the ISO country code for a public IP, or None if it can't be determined."""
-    if not ipaddress.ip_address(ip).is_global:
-        return None  # private/reserved ranges have no country
+    address = ipaddress.ip_address(ip)
+    if not address.is_global or getattr(address, "scope_id", None):
+        return None  # private/reserved ranges have no country; scoped addresses aren't valid public IPs
     try:
         with urllib.request.urlopen(COUNTRY_API_URL.format(ip=ip), timeout=API_TIMEOUT_SECONDS) as response:
-            body = json.load(response)
+            body = json.loads(response.read(MAX_RESPONSE_BYTES))
     except urllib.error.HTTPError as exc:
         exc.close()
         if exc.code != 404:  # 404 means the API has no data for this IP
@@ -139,7 +146,7 @@ def lookup_country(ip: str) -> str | None:
         print(f"warning: country lookup for {ip} failed: {exc!r}", file=sys.stderr)
         return None
     country = body.get("country") if isinstance(body, dict) else None
-    if not isinstance(country, str) or not country:
+    if not isinstance(country, str) or not COUNTRY_CODE.fullmatch(country):
         print(f"warning: country lookup for {ip} failed: unexpected response", file=sys.stderr)
         return None
     return country
@@ -191,6 +198,11 @@ def enrich_countries(db_path: Path) -> int:
 
 # --- Report ------------------------------------------------------------------
 
+def csv_safe(value: str) -> str:
+    """Neutralise values a spreadsheet would run as a formula (CSV injection)."""
+    return f"'{value}" if value.startswith(CSV_FORMULA_PREFIXES) else value
+
+
 def generate_report(db_path: Path, out_dir: Path, report_date: date) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / f"critical_errors_{report_date.isoformat()}.csv"
@@ -204,8 +216,8 @@ def generate_report(db_path: Path, out_dir: Path, report_date: date) -> Path:
         writer.writerow(CSV_COLUMNS)
         for logged_at, level, module, error_code, client_ip, country, message in rows:
             writer.writerow([
-                report_date.isoformat(), logged_at, level, module,
-                error_code or "", client_ip or "", country or "", message,
+                report_date.isoformat(), logged_at, level, csv_safe(module),
+                csv_safe(error_code or ""), client_ip or "", country or "", csv_safe(message),
             ])
     return report_path
 

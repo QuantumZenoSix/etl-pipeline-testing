@@ -55,7 +55,7 @@ class LookupCountryTest(unittest.TestCase):
 
     def test_public_ip_returns_country(self):
         response = mock.MagicMock()
-        response.__enter__.return_value = mock.MagicMock(read=lambda: b'{"ip":"8.8.8.8","country":"US"}')
+        response.__enter__.return_value = mock.MagicMock(read=lambda size=-1: b'{"ip":"8.8.8.8","country":"US"}')
         with mock.patch("etl.urllib.request.urlopen", return_value=response):
             self.assertEqual(etl.lookup_country("8.8.8.8"), "US")
 
@@ -120,7 +120,7 @@ BAD_TIMESTAMP = "[Xyz Foo 99 99:99:99.000000 2026] [core:error] [pid 1] boom"
 
 def fake_response(body: bytes):
     response = mock.MagicMock()
-    response.__enter__.return_value = mock.MagicMock(read=lambda: body)
+    response.__enter__.return_value = mock.MagicMock(read=lambda size=-1: body if size < 0 else body[:size])
     return response
 
 
@@ -183,6 +183,18 @@ class ParseClientIpTest(unittest.TestCase):
     def test_ipv6_with_long_port(self):
         self.assertEqual(etl.parse_client_ip("2001:db8::1:51234"), "2001:db8::1")
 
+    def test_scoped_ipv6_is_rejected(self):
+        payloads = [
+            "2001:4860::1%eth0:80",
+            "2001:4860::1%a?b#c:80",
+            "2001:4860::1%a@evil.com:80",
+            "2001:4860::1%a\x1b[2J:80",
+            "2001:4860::1%1",
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertIsNone(etl.parse_client_ip(payload))
+
     def test_ipv4_with_and_without_port(self):
         self.assertEqual(etl.parse_client_ip("203.0.113.25:80"), "203.0.113.25")
         self.assertEqual(etl.parse_client_ip("203.0.113.25"), "203.0.113.25")
@@ -243,6 +255,22 @@ class LookupCountryErrorHandlingTest(unittest.TestCase):
         result, _ = self.lookup_capturing_stderr(return_value=fake_response(b'{"country": 123}'))
         self.assertIsNone(result)
 
+    def test_scoped_ipv6_makes_no_request(self):
+        with mock.patch("etl.urllib.request.urlopen") as urlopen:
+            self.assertIsNone(etl.lookup_country("2001:4860::1%eth0"))
+        urlopen.assert_not_called()
+
+    def test_invalid_country_codes_return_none(self):
+        for body in (b'{"country": "us"}', b'{"country": "USA"}', b'{"country": ""}', b'{"country": "U\\u001b["}'):
+            with self.subTest(body=body):
+                result, _ = self.lookup_capturing_stderr(return_value=fake_response(body))
+                self.assertIsNone(result)
+
+    def test_response_size_is_capped(self):
+        oversized = b'{"country": "US", "padding": "' + b"x" * etl.MAX_RESPONSE_BYTES + b'"}'
+        result, _ = self.lookup_capturing_stderr(return_value=fake_response(oversized))
+        self.assertIsNone(result)
+
     def test_requests_expected_url_with_timeout(self):
         with mock.patch("etl.urllib.request.urlopen", return_value=fake_response(b'{"country":"US"}')) as urlopen:
             etl.lookup_country("8.8.8.8")
@@ -288,6 +316,33 @@ class EnrichCountriesTest(unittest.TestCase):
     def test_nothing_to_enrich_returns_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(etl.enrich_countries(Path(tmp) / "errors.db"), 0)
+
+
+class CsvInjectionTest(unittest.TestCase):
+    def report_messages(self, messages):
+        lines = [
+            f"[Thu Oct 22 08:30:{i:02d}.000000 2026] [core:error] [pid 1] {message}"
+            for i, message in enumerate(messages)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "errors.db"
+            etl.load_entries(db, [etl.parse_line(line) for line in lines])
+            path = etl.generate_report(db, Path(tmp), date(2026, 10, 22))
+            with path.open(newline="") as f:
+                return [row["message"] for row in csv.DictReader(f)]
+
+    def test_formula_prefixes_are_neutralised(self):
+        messages = ['=HYPERLINK("http://evil/")', "+cmd|' /C calc'!A0", "-2+3", "@SUM(1+1)"]
+        self.assertEqual(self.report_messages(messages), ["'" + m for m in messages])
+
+    def test_ordinary_messages_are_unchanged(self):
+        messages = ["Database connection failed, retrying", "client denied: /admin"]
+        self.assertEqual(self.report_messages(messages), messages)
+
+    def test_csv_safe_covers_tab_and_carriage_return(self):
+        self.assertEqual(etl.csv_safe("\tx"), "'\tx")
+        self.assertEqual(etl.csv_safe("\rx"), "'\rx")
+        self.assertEqual(etl.csv_safe(""), "")
 
 
 class ReportOnEmptyDbTest(unittest.TestCase):
