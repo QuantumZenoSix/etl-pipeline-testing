@@ -1,8 +1,12 @@
 import contextlib
 import csv
+import http.client
 import io
+import sqlite3
 import tempfile
 import unittest
+import urllib.error
+from contextlib import closing
 from datetime import date
 from pathlib import Path
 from unittest import mock
@@ -42,10 +46,6 @@ class ParseLineTest(unittest.TestCase):
     def test_unrecognised_line_returns_none(self):
         self.assertIsNone(etl.parse_line("not an apache line"))
 
-    def test_ipv6_client(self):
-        self.assertEqual(etl.parse_client_ip("2001:db8::1:51234"), "2001:db8::1")
-        self.assertEqual(etl.parse_client_ip("203.0.113.25:80"), "203.0.113.25")
-
 
 class LookupCountryTest(unittest.TestCase):
     def test_private_ip_skips_api(self):
@@ -60,7 +60,7 @@ class LookupCountryTest(unittest.TestCase):
             self.assertEqual(etl.lookup_country("8.8.8.8"), "US")
 
     def test_network_failure_returns_none(self):
-        with mock.patch("etl.urllib.request.urlopen", side_effect=etl.urllib.error.URLError("down")):
+        with mock.patch("etl.urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
             self.assertIsNone(etl.lookup_country("8.8.8.8"))
 
 
@@ -85,13 +85,16 @@ class PipelineTest(unittest.TestCase):
     def test_load_with_no_entries_creates_schema(self):
         db = self.tmp / "errors.db"
         self.assertEqual(etl.load_entries(db, []), 0)
-        etl.generate_report(db, self.tmp, date(2026, 10, 22))
+        with closing(sqlite3.connect(db)) as conn:
+            tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+        self.assertIn("critical_errors", tables)
 
     def test_report_contains_generation_date(self):
         db = self.tmp / "errors.db"
         entries = etl.extract_critical_entries(self.log)
         etl.load_entries(db, entries)
-        with mock.patch("etl.lookup_country", return_value="AU"):
+        # Mirror the real lookup: private IPs have no country.
+        with mock.patch("etl.lookup_country", side_effect=lambda ip: "AU" if ip == "203.0.113.25" else None):
             etl.enrich_countries(db)
 
         path = etl.generate_report(db, self.tmp / "reports", date(2026, 10, 22))
@@ -101,11 +104,12 @@ class PipelineTest(unittest.TestCase):
             rows = list(csv.DictReader(f))
         self.assertEqual(len(rows), 3)
         self.assertEqual({r["report_date"] for r in rows}, {"2026-10-22"})
-        self.assertEqual(rows[0]["country"], "AU")
+        self.assertEqual(rows[0]["country"], "")  # private IP
+        self.assertEqual(rows[1]["country"], "AU")
         self.assertEqual(rows[2]["client_ip"], "")  # emerg line has no client
 
 
-# --- Architecture-review findings --------------------------------------------
+# --- Enrichment, parsing and robustness ---------------------------------------
 
 PUBLIC_ERROR = (
     "[Thu Oct 22 08:40:00.000001 2026] [php:error] [pid 1024:tid 1140] [client 8.8.8.8:40000] "
@@ -121,7 +125,7 @@ def fake_response(body: bytes):
 
 
 def http_error(code: int):
-    return etl.urllib.error.HTTPError("https://api.country.is/8.8.8.8", code, "msg", {}, None)
+    return urllib.error.HTTPError("https://api.country.is/8.8.8.8", code, "msg", {}, None)
 
 
 def run_pipeline(log: Path, db: Path) -> int:
@@ -133,7 +137,7 @@ def run_pipeline(log: Path, db: Path) -> int:
 
 
 class EnrichmentIdempotencyTest(unittest.TestCase):
-    """Finding 1 (Medium): lookups run before dedupe, so failures are never backfilled and re-runs repeat API calls."""
+    """Failed lookups are retried on the next run; resolved IPs are never looked up again."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -144,7 +148,7 @@ class EnrichmentIdempotencyTest(unittest.TestCase):
         self.db = self.tmp / "errors.db"
 
     def stored_country(self):
-        with etl.closing(etl.sqlite3.connect(self.db)) as conn:
+        with closing(sqlite3.connect(self.db)) as conn:
             return conn.execute("SELECT country FROM critical_errors").fetchone()[0]
 
     def test_country_backfilled_after_transient_lookup_failure(self):
@@ -168,13 +172,16 @@ class EnrichmentIdempotencyTest(unittest.TestCase):
 
 
 class ParseClientIpTest(unittest.TestCase):
-    """Finding 2 (Medium): unbracketed IPv6 with a short port is misparsed."""
+    """Apache writes IPv6 clients unbracketed, so a short port like :8080 looks like an address group."""
 
     def test_ipv6_with_short_port(self):
         self.assertEqual(etl.parse_client_ip("2001:db8::1:8080"), "2001:db8::1")
 
     def test_ipv6_loopback_with_short_port(self):
         self.assertEqual(etl.parse_client_ip("::1:80"), "::1")
+
+    def test_ipv6_with_long_port(self):
+        self.assertEqual(etl.parse_client_ip("2001:db8::1:51234"), "2001:db8::1")
 
     def test_ipv4_with_and_without_port(self):
         self.assertEqual(etl.parse_client_ip("203.0.113.25:80"), "203.0.113.25")
@@ -186,7 +193,7 @@ class ParseClientIpTest(unittest.TestCase):
 
 
 class LookupCountryErrorHandlingTest(unittest.TestCase):
-    """Finding 3 (Low-Medium): API failure modes."""
+    """Every API failure mode returns None so the pipeline keeps going."""
 
     def lookup_capturing_stderr(self, **urlopen_kwargs):
         stderr = io.StringIO()
@@ -222,6 +229,25 @@ class LookupCountryErrorHandlingTest(unittest.TestCase):
         result, _ = self.lookup_capturing_stderr(return_value=fake_response(b"<html>oops"))
         self.assertIsNone(result)
 
+    def test_undecodable_body_returns_none(self):
+        result, stderr = self.lookup_capturing_stderr(return_value=fake_response(b"\xff\xfe"))
+        self.assertIsNone(result)
+        self.assertIn("warning", stderr)
+
+    def test_dropped_connection_returns_none(self):
+        result, stderr = self.lookup_capturing_stderr(side_effect=http.client.RemoteDisconnected("closed"))
+        self.assertIsNone(result)
+        self.assertIn("warning", stderr)
+
+    def test_non_string_country_returns_none(self):
+        result, _ = self.lookup_capturing_stderr(return_value=fake_response(b'{"country": 123}'))
+        self.assertIsNone(result)
+
+    def test_requests_expected_url_with_timeout(self):
+        with mock.patch("etl.urllib.request.urlopen", return_value=fake_response(b'{"country":"US"}')) as urlopen:
+            etl.lookup_country("8.8.8.8")
+        urlopen.assert_called_once_with("https://api.country.is/8.8.8.8", timeout=etl.API_TIMEOUT_SECONDS)
+
 
 class EnrichCountriesTest(unittest.TestCase):
     def test_one_lookup_per_unique_ip_and_no_client_left_none(self):
@@ -236,12 +262,20 @@ class EnrichCountriesTest(unittest.TestCase):
             etl.load_entries(db, entries)
             with mock.patch("etl.lookup_country", side_effect=lambda ip: {"8.8.8.8": "US"}.get(ip)) as lookup:
                 updated = etl.enrich_countries(db)
-            with etl.closing(etl.sqlite3.connect(db)) as conn:
+            with closing(sqlite3.connect(db)) as conn:
                 countries = [r[0] for r in conn.execute("SELECT country FROM critical_errors ORDER BY id")]
 
         self.assertEqual(sorted(c.args[0] for c in lookup.call_args_list), ["203.0.113.25", "8.8.8.8"])
         self.assertEqual(countries, ["US", "US", None, None])
         self.assertEqual(updated, 2)
+
+    def test_private_ip_makes_no_http_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "errors.db"
+            etl.load_entries(db, [etl.parse_line(CODED_ERROR)])
+            with mock.patch("etl.urllib.request.urlopen") as urlopen:
+                self.assertEqual(etl.enrich_countries(db), 0)
+        urlopen.assert_not_called()
 
     def test_nothing_to_enrich_returns_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -250,7 +284,7 @@ class EnrichCountriesTest(unittest.TestCase):
 
 class ReportOnEmptyDbTest(unittest.TestCase):
     def test_report_on_brand_new_db_without_table(self):
-        """Finding 4 (Low): should yield a header-only report, not 'no such table'."""
+        """A fresh database yields a header-only report, not 'no such table'."""
         with tempfile.TemporaryDirectory() as tmp:
             path = etl.generate_report(Path(tmp) / "new.db", Path(tmp), date(2026, 10, 22))
             with path.open(newline="") as f:
@@ -259,7 +293,7 @@ class ReportOnEmptyDbTest(unittest.TestCase):
 
 
 class ExtractRobustnessTest(unittest.TestCase):
-    """Finding 5 (Low) and finding 6 (Minor)."""
+    """Bad input lines, a missing log, and duplicate lines."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -275,10 +309,16 @@ class ExtractRobustnessTest(unittest.TestCase):
         self.assertEqual([e.level for e in entries], ["emerg"])
         self.assertIn("line 1 skipped", stderr.getvalue())
 
-    def test_missing_log_file_raises_file_not_found(self):
-        # Current behaviour: raw FileNotFoundError propagates (no friendlier message from main()).
-        with self.assertRaises(FileNotFoundError):
-            etl.extract_critical_entries(self.tmp / "nope.log")
+    def test_undecodable_bytes_do_not_abort_extract(self):
+        log = self.tmp / "error.log"
+        log.write_bytes(EMERG.encode() + b"\n" + CODED_ERROR.encode().replace(b"denied", b"d\xffnied") + b"\n")
+        self.assertEqual([e.level for e in etl.extract_critical_entries(log)], ["emerg", "error"])
+
+    def test_missing_log_file_exits_with_clear_message(self):
+        argv = ["etl.py", "--log", str(self.tmp / "nope.log"), "--db", str(self.tmp / "e.db")]
+        with mock.patch("sys.argv", argv), self.assertRaises(SystemExit) as raised:
+            etl.main()
+        self.assertIn("log file not found", str(raised.exception))
 
     def test_identical_raw_lines_collapse_into_one_row(self):
         # Documents CURRENT behaviour (raw_line UNIQUE): two distinct events with identical text are merged.

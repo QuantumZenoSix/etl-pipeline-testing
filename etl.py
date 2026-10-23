@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import http.client
 import ipaddress
 import json
 import re
@@ -99,7 +100,7 @@ def parse_line(line: str) -> LogEntry | None:
 
 def extract_critical_entries(log_path: Path) -> list[LogEntry]:
     entries = []
-    with log_path.open(encoding="utf-8") as log_file:
+    with log_path.open(encoding="utf-8", errors="replace") as log_file:
         for line_number, raw in enumerate(log_file, start=1):
             line = raw.rstrip("\n")
             if not line.strip():
@@ -124,16 +125,21 @@ def lookup_country(ip: str) -> str | None:
     try:
         with urllib.request.urlopen(COUNTRY_API_URL.format(ip=ip), timeout=API_TIMEOUT_SECONDS) as response:
             body = json.load(response)
-        if not isinstance(body, dict):
-            print(f"warning: country lookup for {ip} failed: unexpected response {type(body).__name__}", file=sys.stderr)
-            return None
-        return body.get("country")
     except urllib.error.HTTPError as exc:
+        exc.close()
         if exc.code != 404:  # 404 means the API has no data for this IP
             print(f"warning: country lookup for {ip} failed: HTTP {exc.code}", file=sys.stderr)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        print(f"warning: country lookup for {ip} failed: {exc}", file=sys.stderr)
-    return None
+        return None
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        # OSError covers URLError and timeouts, HTTPException covers dropped connections,
+        # ValueError covers invalid JSON or an undecodable body.
+        print(f"warning: country lookup for {ip} failed: {exc!r}", file=sys.stderr)
+        return None
+    country = body.get("country") if isinstance(body, dict) else None
+    if not isinstance(country, str) or not country:
+        print(f"warning: country lookup for {ip} failed: unexpected response", file=sys.stderr)
+        return None
+    return country
 
 
 # --- Load --------------------------------------------------------------------
@@ -146,7 +152,7 @@ def open_db(db_path: Path) -> sqlite3.Connection:
 
 def load_entries(db_path: Path, entries: list[LogEntry]) -> int:
     """Insert entries, skipping lines already stored. Returns the number of new rows."""
-    columns = [c for c in asdict(entries[0]) if c != "id"] if entries else []
+    columns = list(asdict(entries[0])) if entries else []
     with closing(open_db(db_path)) as conn, conn:
         if not entries:
             return 0
@@ -207,11 +213,14 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=Path("reports"), help="directory for the CSV report")
     args = parser.parse_args()
 
-    entries = extract_critical_entries(args.log)
+    try:
+        entries = extract_critical_entries(args.log)
+    except FileNotFoundError:
+        sys.exit(f"error: log file not found: {args.log}")
     print(f"Extracted {len(entries)} critical entries from {args.log}")
 
     inserted = load_entries(args.db, entries)
-    print(f"Stored {inserted} new rows in {args.db} ({len(entries) - inserted} already present)")
+    print(f"Stored {inserted} new rows in {args.db} ({len(entries) - inserted} skipped as already stored or duplicate lines)")
 
     updated = enrich_countries(args.db)
     print(f"Set the country on {updated} rows")

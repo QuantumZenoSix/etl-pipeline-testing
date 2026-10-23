@@ -31,6 +31,8 @@ python3 -m unittest
 ## Notes
 
 - `country` is left blank when it can't be determined: the line has no client IP, the IP is private/reserved (e.g. `192.168.x.x`, `203.0.113.x`), the API has no data for it, or the API call failed (a warning is printed; the pipeline continues). The sample `error.log` only contains such IPs, so its report has no countries.
-- The report contains every critical row in the database, not just the current run's.
-- Client IPs are sent to api.country.is (5 second timeout, one request per unique public IP, no retries).
-- Lines that don't match the Apache error log format are skipped with a warning.
+- The report contains every critical row in the database, not just the current run's. Running it twice on the same day overwrites that day's file.
+- Client IPs are sent to api.country.is (5 second timeout, one request per unique public IP per run). IPs still without a country are looked up again on every run, including ones the API has no data for.
+- Lines that don't match the Apache error log format, or have an unparsable timestamp, are skipped with a warning. Undecodable bytes in the log are replaced rather than aborting the run.
+- Timestamps are stored exactly as written in the log (no timezone conversion).
+- Identical log lines (same timestamp, pid, tid and text) are stored once.
