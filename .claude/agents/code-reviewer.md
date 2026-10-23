@@ -79,6 +79,7 @@ A behavior change only counts as a regression if it conflicts with an establishe
 - concurrency, unexpected external responses
 - invalid or partial config, permission failures
 - differences between dev and production environments
+- assume the input can be messy or even missing critical elements (important for ETL & data pipeline projects)
 
 **Error handling and failure modes:**
 - swallowed errors, catch blocks that are too broad, wrong exception types
