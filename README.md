@@ -6,9 +6,9 @@ A small ETL pipeline that turns an Apache `error.log` into a SQLite database and
 
 1. **Extract** – reads `error.log` and parses each line (timestamp, module, level, pid/tid, client IP, `AH` code, message).
 2. **Filter** – keeps only critical levels: `emerg`, `alert`, `crit`, `error`.
-3. **Enrich** – looks up the country of each client IP via [api.country.is](https://api.country.is/).
-4. **Transform** – normalises the fields (ISO timestamp, port stripped from the client address).
-5. **Load** – stores the rows in `errors.db` (table `critical_errors`). Re-running is safe: lines already stored are skipped.
+3. **Transform** – normalises the fields (ISO timestamp, port stripped from the client address).
+4. **Load** – stores the rows in `errors.db` (table `critical_errors`). Re-running is safe: lines already stored are skipped.
+5. **Enrich** – looks up the country of stored client IPs that have none yet via [api.country.is](https://api.country.is/). IPs already resolved are not looked up again, and failed lookups are retried on the next run.
 6. **Report** – writes `reports/critical_errors_<YYYY-MM-DD>.csv` from the database. The generation date is in the filename and in the `report_date` column.
 
 CSV columns: `report_date, logged_at, level, module, error_code, client_ip, country, message`

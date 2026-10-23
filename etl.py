@@ -68,7 +68,9 @@ def parse_client_ip(client: str | None) -> str | None:
     """Strip the port from Apache's `[client ip:port]` value (IPv4 or IPv6)."""
     if not client:
         return None
-    for candidate in (client, client.rsplit(":", 1)[0]):
+    # Apache always appends ":port". Strip it first: for IPv6 a short port such as
+    # ":8080" is itself a valid group, so the whole string would parse as a wrong address.
+    for candidate in (client.rsplit(":", 1)[0], client):
         try:
             return str(ipaddress.ip_address(candidate))
         except ValueError:
@@ -121,7 +123,11 @@ def lookup_country(ip: str) -> str | None:
         return None  # private/reserved ranges have no country
     try:
         with urllib.request.urlopen(COUNTRY_API_URL.format(ip=ip), timeout=API_TIMEOUT_SECONDS) as response:
-            return json.load(response).get("country")
+            body = json.load(response)
+        if not isinstance(body, dict):
+            print(f"warning: country lookup for {ip} failed: unexpected response {type(body).__name__}", file=sys.stderr)
+            return None
+        return body.get("country")
     except urllib.error.HTTPError as exc:
         if exc.code != 404:  # 404 means the API has no data for this IP
             print(f"warning: country lookup for {ip} failed: HTTP {exc.code}", file=sys.stderr)
@@ -130,19 +136,18 @@ def lookup_country(ip: str) -> str | None:
     return None
 
 
-def add_countries(entries: list[LogEntry]) -> None:
-    countries = {ip: lookup_country(ip) for ip in {e.client_ip for e in entries if e.client_ip}}
-    for entry in entries:
-        entry.country = countries.get(entry.client_ip)
-
-
 # --- Load --------------------------------------------------------------------
+
+def open_db(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.execute(SCHEMA)
+    return conn
+
 
 def load_entries(db_path: Path, entries: list[LogEntry]) -> int:
     """Insert entries, skipping lines already stored. Returns the number of new rows."""
     columns = [c for c in asdict(entries[0]) if c != "id"] if entries else []
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute(SCHEMA)
+    with closing(open_db(db_path)) as conn, conn:
         if not entries:
             return 0
         before = conn.total_changes
@@ -154,12 +159,32 @@ def load_entries(db_path: Path, entries: list[LogEntry]) -> int:
         return conn.total_changes - before
 
 
+def enrich_countries(db_path: Path) -> int:
+    """Look up the country of stored IPs that don't have one yet. Returns the number of rows updated.
+
+    Runs after the load so already-resolved IPs are never looked up again, and IPs whose
+    earlier lookup failed are retried on the next run.
+    """
+    with closing(open_db(db_path)) as conn:
+        pending_ips = [row[0] for row in conn.execute(
+            "SELECT DISTINCT client_ip FROM critical_errors WHERE client_ip IS NOT NULL AND country IS NULL"
+        )]
+        # Look up outside any write transaction so slow API calls don't hold the database lock.
+        found = [(lookup_country(ip), ip) for ip in pending_ips]
+        with conn:
+            cursor = conn.executemany(
+                "UPDATE critical_errors SET country = ? WHERE client_ip = ? AND country IS NULL",
+                [(country, ip) for country, ip in found if country],
+            )
+        return cursor.rowcount
+
+
 # --- Report ------------------------------------------------------------------
 
 def generate_report(db_path: Path, out_dir: Path, report_date: date) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / f"critical_errors_{report_date.isoformat()}.csv"
-    with closing(sqlite3.connect(db_path)) as conn:
+    with closing(open_db(db_path)) as conn:
         rows = conn.execute(
             "SELECT logged_at, level, module, error_code, client_ip, country, message "
             "FROM critical_errors ORDER BY logged_at"
@@ -185,10 +210,11 @@ def main() -> None:
     entries = extract_critical_entries(args.log)
     print(f"Extracted {len(entries)} critical entries from {args.log}")
 
-    add_countries(entries)
-
     inserted = load_entries(args.db, entries)
     print(f"Stored {inserted} new rows in {args.db} ({len(entries) - inserted} already present)")
+
+    updated = enrich_countries(args.db)
+    print(f"Set the country on {updated} rows")
 
     report_path = generate_report(args.db, args.out_dir, date.today())
     print(f"Report written to {report_path}")
