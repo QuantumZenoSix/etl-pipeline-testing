@@ -21,7 +21,15 @@ Requires Python 3.10+ and no third-party packages.
 ```
 python3 etl.py                      # uses ./error.log, ./errors.db, ./reports/
 python3 etl.py --log other.log --db other.db --out-dir out
-```
+```  
+
+_output_
+```shell
+Extracted 10 critical entries from error.log
+Stored 10 new rows in errors.db (0 skipped as already stored or duplicate lines)
+Set the country on 0 rows
+Report written to reports/critical_errors_2026-10-23.csv  
+```  
 
 Run the tests:
 
