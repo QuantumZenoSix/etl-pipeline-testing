@@ -1,6 +1,6 @@
-# etl-pipeline-sample
+# ETL pipeline testing 
 
-A small ETL pipeline that turns an Apache `error.log` into a SQLite database and a dated CSV report of critical issues.
+A small ETL pipeline project that turns an Apache `error.log` into a SQLite database and a dated CSV report of critical issues.
 This project was not only intended to show experience is simple ETL scripting but to show how I was able to leverage AI tools like Claude Code to make a better application by using my [Claude Code config](https://github.com/QuantumZenoSix/claude-code-toolkit) as a base to build from.
 
 ## What it does
