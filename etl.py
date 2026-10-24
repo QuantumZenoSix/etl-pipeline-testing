@@ -33,6 +33,8 @@ LOG_LINE = re.compile(
     r"\s*(?P<message>.*)$"
 )
 TIMESTAMP_FORMAT = "%a %b %d %H:%M:%S.%f %Y"
+# SQLite INTEGER is signed 64-bit; larger pid/tid values make the whole load batch fail.
+MAX_SQLITE_INTEGER = 2**63 - 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS critical_errors (
@@ -88,6 +90,13 @@ def parse_client_ip(client: str | None) -> str | None:
     return None
 
 
+def parse_process_id(value: str, field: str) -> int:
+    number = int(value)
+    if number > MAX_SQLITE_INTEGER:
+        raise ValueError(f"{field} too large")
+    return number
+
+
 def parse_line(line: str) -> LogEntry | None:
     match = LOG_LINE.match(line)
     if not match:
@@ -98,8 +107,8 @@ def parse_line(line: str) -> LogEntry | None:
         logged_at=logged_at,
         module=fields["module"],
         level=fields["level"],
-        pid=int(fields["pid"]),
-        tid=int(fields["tid"]) if fields["tid"] else None,
+        pid=parse_process_id(fields["pid"], "pid"),
+        tid=parse_process_id(fields["tid"], "tid") if fields["tid"] else None,
         client_ip=parse_client_ip(fields["client"]),
         error_code=fields["code"],
         message=fields["message"].strip(),
@@ -117,7 +126,7 @@ def extract_critical_entries(log_path: Path) -> list[LogEntry]:
             try:
                 entry = parse_line(line)
             except ValueError as exc:
-                print(f"warning: line {line_number} skipped, bad timestamp: {exc}", file=sys.stderr)
+                print(f"warning: line {line_number} skipped, invalid field: {exc}", file=sys.stderr)
                 continue
             if entry is None:
                 print(f"warning: line {line_number} skipped, unrecognised format", file=sys.stderr)
@@ -140,9 +149,9 @@ def lookup_country(ip: str) -> str | None:
         if exc.code != 404:  # 404 means the API has no data for this IP
             print(f"warning: country lookup for {ip} failed: HTTP {exc.code}", file=sys.stderr)
         return None
-    except (OSError, http.client.HTTPException, ValueError) as exc:
+    except (OSError, http.client.HTTPException, ValueError, RecursionError) as exc:
         # OSError covers URLError and timeouts, HTTPException covers dropped connections,
-        # ValueError covers invalid JSON or an undecodable body.
+        # ValueError covers invalid JSON or an undecodable body, RecursionError covers deeply nested JSON.
         print(f"warning: country lookup for {ip} failed: {exc!r}", file=sys.stderr)
         return None
     country = body.get("country") if isinstance(body, dict) else None

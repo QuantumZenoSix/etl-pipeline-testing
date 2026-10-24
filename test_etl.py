@@ -266,6 +266,11 @@ class LookupCountryErrorHandlingTest(unittest.TestCase):
                 result, _ = self.lookup_capturing_stderr(return_value=fake_response(body))
                 self.assertIsNone(result)
 
+    def test_deeply_nested_json_returns_none(self):
+        result, stderr = self.lookup_capturing_stderr(return_value=fake_response(b"[" * 60000))
+        self.assertIsNone(result)
+        self.assertIn("warning", stderr)
+
     def test_response_size_is_capped(self):
         oversized = b'{"country": "US", "padding": "' + b"x" * etl.MAX_RESPONSE_BYTES + b'"}'
         result, _ = self.lookup_capturing_stderr(return_value=fake_response(oversized))
@@ -376,6 +381,28 @@ class ExtractRobustnessTest(unittest.TestCase):
         log = self.tmp / "error.log"
         log.write_bytes(EMERG.encode() + b"\n" + CODED_ERROR.encode().replace(b"denied", b"d\xffnied") + b"\n")
         self.assertEqual([e.level for e in etl.extract_critical_entries(log)], ["emerg", "error"])
+
+    def test_oversized_pid_or_tid_line_is_skipped_and_rest_still_loads(self):
+        too_big = str(2**63)
+        lines = [
+            EMERG,
+            f"[Thu Oct 22 08:30:16.000001 2026] [core:emerg] [pid {too_big}:tid 1] boom",
+            f"[Thu Oct 22 08:30:17.000001 2026] [core:emerg] [pid 1:tid {too_big}] boom",
+        ]
+        log = self.tmp / "error.log"
+        log.write_text("\n".join(lines) + "\n")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            entries = etl.extract_critical_entries(log)
+        self.assertEqual(len(entries), 1)
+        self.assertIn("line 2 skipped", stderr.getvalue())
+        self.assertIn("line 3 skipped", stderr.getvalue())
+        self.assertEqual(etl.load_entries(self.tmp / "errors.db", entries), 1)
+
+    def test_largest_sqlite_integer_pid_still_loads(self):
+        line = f"[Thu Oct 22 08:30:16.000001 2026] [core:emerg] [pid {etl.MAX_SQLITE_INTEGER}] boom"
+        entry = etl.parse_line(line)
+        self.assertEqual(etl.load_entries(self.tmp / "errors.db", [entry]), 1)
 
     def test_missing_log_file_exits_with_clear_message(self):
         argv = ["etl.py", "--log", str(self.tmp / "nope.log"), "--db", str(self.tmp / "e.db")]
